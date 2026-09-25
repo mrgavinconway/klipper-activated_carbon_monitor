@@ -9,16 +9,26 @@ import os
 import time
 
 
-DEFAULT_MATERIAL_FACTORS = {
-    "UNKNOWN": 1.00,
-    "PLA": 0.15,
-    "PETG": 0.30,
-    "TPU": 0.25,
-    "ABS": 1.00,
-    "ASA": 0.90,
-    "PC": 0.80,
-    "PA": 0.65,
+# Baseline TVOC emission rates in mg/h. These are deliberately rounded,
+# conservative defaults derived from published chamber studies. They are
+# estimates for material classes, not guarantees for an individual spool.
+# See docs/RESEARCH.md for sources and rationale.
+MATERIAL_PROFILES = {
+    "PLA": {"voc_mg_h": 0.23, "nozzle": (180., 235.), "bed": (20., 70.), "chamber": (0., 45.)},
+    "PVA": {"voc_mg_h": 0.15, "nozzle": (180., 250.), "bed": (20., 65.), "chamber": (0., 45.)},
+    "PC": {"voc_mg_h": 0.18, "nozzle": (250., 315.), "bed": (90., 125.), "chamber": (35., 90.)},
+    "PA": {"voc_mg_h": 0.61, "nozzle": (240., 305.), "bed": (40., 105.), "chamber": (25., 90.)},
+    "TPU": {"voc_mg_h": 0.75, "nozzle": (205., 245.), "bed": (20., 65.), "chamber": (0., 45.)},
+    "HIPS": {"voc_mg_h": 0.89, "nozzle": (225., 275.), "bed": (80., 120.), "chamber": (30., 90.)},
+    "ABS": {"voc_mg_h": 1.02, "nozzle": (225., 280.), "bed": (80., 115.), "chamber": (30., 90.)},
+    "PETG": {"voc_mg_h": 1.50, "nozzle": (215., 270.), "bed": (55., 95.), "chamber": (0., 55.)},
+    "ASA": {"voc_mg_h": 3.00, "nozzle": (235., 275.), "bed": (70., 120.), "chamber": (30., 90.)},
+    "UNKNOWN": {"voc_mg_h": 3.00, "nozzle": (0., 1000.), "bed": (0., 1000.), "chamber": (0., 1000.)},
 }
+
+REFERENCE_VOC_MG_H = MATERIAL_PROFILES["ABS"]["voc_mg_h"]
+DEFAULT_SERVICE_LIFE_HOURS = 50.0
+DEFAULT_BACKGROUND_LOAD = 0.20
 
 
 class ActivatedCarbonMonitor:
@@ -30,55 +40,50 @@ class ActivatedCarbonMonitor:
             raise config.error("[activated_carbon_monitor] requires a name")
         self.name = parts[1]
 
-        self.carbon_mass_g = config.getfloat("carbon_mass_g", 500., above=0.)
-        self.carbon_form = config.get("carbon_form", "pellet")
-        # Capacity is deliberately expressed as weighted full-flow hours per
-        # 100g. It is a service-life estimate, not adsorption chemistry.
-        self.capacity_hours_per_100g = config.getfloat(
-            "capacity_hours_per_100g", 20., above=0.)
+        # Minimal configuration is just fans. Everything else has defaults.
+        self.fan_specs = self._parse_fans(config.get("fans"))
+        self.airflow_curves = {}
+        for spec in self.fan_specs:
+            raw_curve = config.get("airflow_curve_" + spec["alias"], None)
+            self.airflow_curves[spec["alias"]] = self._parse_airflow_curve(raw_curve)
+        self.extruder_name = config.get("extruder", "extruder")
+        self.bed_name = config.get("bed", "heater_bed")
+        self.chamber_name = config.get("chamber_sensor", None)
+        self.service_life_hours = config.getfloat(
+            "service_life_hours", DEFAULT_SERVICE_LIFE_HOURS, above=0.)
+        self.background_load = config.getfloat(
+            "background_load", DEFAULT_BACKGROUND_LOAD, minval=0.)
         self.sample_interval = config.getfloat("sample_interval", 5., above=0.)
         self.save_interval = config.getfloat("save_interval", 60., above=0.)
         self.projection_window_days = config.getfloat(
             "projection_window_days", 14., above=0.)
-
         self.state_file = os.path.expanduser(config.get(
             "state_file",
             "~/printer_data/config/activated_carbon_monitor.json"))
-
-        self.fan_specs = self._parse_fans(config.get("fans"))
-        self.airflow_curves = {}
-        for spec in self.fan_specs:
-            curve = config.get("airflow_curve_" + spec["alias"], None)
-            self.airflow_curves[spec["alias"]] = self._parse_curve(
-                curve, spec["rated_cfm"])
-
-        self.extruder_name = config.get("extruder", "extruder")
-        self.bed_name = config.get("bed", "heater_bed")
-        self.chamber_name = config.get("chamber_sensor", None)
-
-        self.material_factors = dict(DEFAULT_MATERIAL_FACTORS)
-        factors = config.get("material_factors", None)
-        if factors:
-            for token in factors.replace("\n", " ").split():
-                if "=" not in token:
-                    continue
-                name, value = token.split("=", 1)
-                self.material_factors[name.strip().upper()] = float(value)
 
         self.fans = []
         self.extruder = None
         self.bed = None
         self.chamber = None
+        self.idle_timeout = None
+
         self.current_material = "UNKNOWN"
         self.material_source = "inferred"
-        self.current_airflow_cfm = 0.
+        self.current_voc_rate_mg_h = 0.
+        self.current_airflow_fraction = 0.
+        self.current_airflow_cfm = None
         self.current_fan_speeds = {}
-        self.active_seconds = 0.
-        self.weighted_fullflow_seconds = 0.
-        self.air_processed_ft3 = 0.
+        self.current_fan_rpms = {}
+
         self.installed_at = int(time.time())
+        self.active_seconds = 0.
+        self.service_usage_seconds = 0.
+        self.estimated_voc_generated_mg = 0.
+        self.estimated_voc_filtered_mg = 0.
+        self.air_processed_ft3 = 0.
         self.history = []
         self.daily_usage = {}
+        self.voc_by_material_mg = {}
         self.last_sample = None
         self.last_save = 0.
         self._load_state()
@@ -86,13 +91,14 @@ class ActivatedCarbonMonitor:
         self.gcode = self.printer.lookup_object("gcode")
         self.gcode.register_mux_command(
             "CARBON_STATUS", "FILTER", self.name, self.cmd_CARBON_STATUS,
-            desc="Report activated carbon status")
+            desc="Report activated carbon monitor status")
         self.gcode.register_mux_command(
             "CARBON_SET_MATERIAL", "FILTER", self.name,
-            self.cmd_CARBON_SET_MATERIAL, desc="Override material")
+            self.cmd_CARBON_SET_MATERIAL, desc="Override inferred material")
         self.gcode.register_mux_command(
             "CARBON_AUTO_MATERIAL", "FILTER", self.name,
-            self.cmd_CARBON_AUTO_MATERIAL, desc="Return to temperature inference")
+            self.cmd_CARBON_AUTO_MATERIAL,
+            desc="Return to temperature-based material inference")
         self.gcode.register_mux_command(
             "CARBON_REPLACE", "FILTER", self.name, self.cmd_CARBON_REPLACE,
             desc="Record activated carbon replacement")
@@ -102,71 +108,127 @@ class ActivatedCarbonMonitor:
         self.timer = self.reactor.register_timer(self._sample, self.reactor.NEVER)
 
     def _parse_fans(self, raw):
-        # Syntax: alias=klipper object,rated_cfm ; alias2=object,rated_cfm
+        """Parse minimal fan list.
+
+        Preferred syntax:
+          fans: fan_generic filter_left; fan_generic filter_right
+
+        Optional absolute airflow can be provided without changing the simple
+        path:
+          fans: fan_generic filter_left@2.0; fan_generic filter_right@2.0
+
+        The optional number is estimated full-flow CFM through the installed
+        filter, not free-air fan CFM.
+        """
         specs = []
-        for item in raw.split(";"):
+        for item in raw.replace("\n", ";").split(";"):
             item = item.strip()
             if not item:
                 continue
-            try:
-                alias, rest = item.split("=", 1)
-                obj, cfm = rest.rsplit(",", 1)
-                specs.append({"alias": alias.strip(), "object": obj.strip(),
-                              "rated_cfm": float(cfm)})
-            except Exception:
-                raise self.printer.config_error(
-                    "Invalid fans entry '%s'; expected alias=object,rated_cfm" % item)
+            cfm = None
+            object_name = item
+            if "@" in item:
+                object_name, raw_cfm = item.rsplit("@", 1)
+                object_name = object_name.strip()
+                try:
+                    cfm = float(raw_cfm.strip())
+                except ValueError:
+                    raise self.printer.config_error(
+                        "Invalid fan CFM in '%s'" % item)
+                if cfm <= 0.:
+                    raise self.printer.config_error(
+                        "Fan CFM must be greater than zero in '%s'" % item)
+            alias = object_name.split()[-1].replace("-", "_")
+            specs.append({"alias": alias, "object": object_name, "cfm": cfm})
         if not specs:
-            raise self.printer.config_error("At least one filtration fan is required")
+            raise self.printer.config_error(
+                "At least one filtration fan must be listed in 'fans'")
         return specs
 
-    def _parse_curve(self, raw, rated_cfm):
-        # PWM:CFM pairs; endpoints are added when absent.
-        if not raw:
-            return [(0., 0.), (1., rated_cfm)]
-        pts = []
-        for token in raw.replace(",", " ").split():
-            pwm, cfm = token.split(":", 1)
-            p = float(pwm)
-            if p > 1.:
-                p /= 100.
-            pts.append((max(0., min(1., p)), max(0., float(cfm))))
-        pts.sort()
-        if not pts or pts[0][0] > 0.:
-            pts.insert(0, (0., 0.))
-        if pts[-1][0] < 1.:
-            pts.append((1., rated_cfm))
-        return pts
+    def _parse_airflow_curve(self, raw):
+        """Return PWM->relative-flow points. Default is linear.
 
-    def _curve_cfm(self, alias, speed):
-        pts = self.airflow_curves[alias]
-        for idx in range(1, len(pts)):
-            p0, c0 = pts[idx - 1]
-            p1, c1 = pts[idx]
+        Values on the right hand side are relative flow (0..1), so one curve
+        works whether or not the user also supplies full-flow CFM.
+        Example: 0:0 20:0 40:0.25 60:0.55 80:0.80 100:1
+        """
+        if not raw:
+            return [(0., 0.), (1., 1.)]
+        points = []
+        for token in raw.replace(",", " ").split():
+            try:
+                pwm, flow = token.split(":", 1)
+                pwm = float(pwm)
+                flow = float(flow)
+            except Exception:
+                raise self.printer.config_error(
+                    "Invalid airflow curve point '%s'" % token)
+            if pwm > 1.:
+                pwm /= 100.
+            points.append((max(0., min(1., pwm)), max(0., min(1., flow))))
+        points.sort()
+        if points[0][0] > 0.:
+            points.insert(0, (0., 0.))
+        if points[-1][0] < 1.:
+            points.append((1., 1.))
+        return points
+
+    def _flow_fraction(self, alias, speed):
+        points = self.airflow_curves[alias]
+        for idx in range(1, len(points)):
+            p0, f0 = points[idx - 1]
+            p1, f1 = points[idx]
             if speed <= p1:
                 if p1 == p0:
-                    return c1
+                    return f1
                 ratio = (speed - p0) / (p1 - p0)
-                return c0 + ratio * (c1 - c0)
-        return pts[-1][1]
+                return f0 + ratio * (f1 - f0)
+        return points[-1][1]
 
     def _connect(self):
         self.fans = []
         for spec in self.fan_specs:
-            try:
-                obj = self.printer.lookup_object(spec["object"])
-            except Exception:
+            obj = self.printer.lookup_object(spec["object"], None)
+            if obj is None:
                 raise self.printer.config_error(
                     "Unable to find filtration fan '%s'" % spec["object"])
             self.fans.append((spec, obj))
+
         self.extruder = self.printer.lookup_object(self.extruder_name, None)
         self.bed = self.printer.lookup_object(self.bed_name, None)
-        if self.chamber_name:
-            self.chamber = self.printer.lookup_object(self.chamber_name, None)
+        self.idle_timeout = self.printer.lookup_object("idle_timeout", None)
+        self.chamber = self._find_chamber_sensor()
+
         now = self.reactor.monotonic()
         self.last_sample = now
         self.last_save = now
         self.reactor.update_timer(self.timer, now + self.sample_interval)
+
+    def _find_chamber_sensor(self):
+        if self.chamber_name:
+            return self.printer.lookup_object(self.chamber_name, None)
+        heaters = self.printer.lookup_object("heaters", None)
+        if heaters is None:
+            return None
+        try:
+            status = heaters.get_status(self.reactor.monotonic())
+            names = status.get("available_sensors", [])
+        except Exception:
+            return None
+        preferred = (
+            "temperature_sensor chamber",
+            "temperature_sensor enclosure",
+            "heater_generic chamber",
+        )
+        lower_map = {name.lower(): name for name in names}
+        for name in preferred:
+            if name in lower_map:
+                return self.printer.lookup_object(lower_map[name], None)
+        for name in names:
+            lname = name.lower()
+            if "chamber" in lname or "enclosure" in lname:
+                return self.printer.lookup_object(name, None)
+        return None
 
     def _shutdown(self):
         self._save_state()
@@ -180,62 +242,92 @@ class ActivatedCarbonMonitor:
         except Exception:
             return None, None
 
+    def _is_printing(self, eventtime):
+        if self.idle_timeout is None:
+            return False
+        try:
+            return self.idle_timeout.get_status(eventtime).get("state") == "Printing"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _in_range(value, bounds):
+        return bounds[0] <= value <= bounds[1]
+
     def _infer_material(self, eventtime):
         nozzle, nozzle_target = self._temperature(self.extruder, eventtime)
         bed, bed_target = self._temperature(self.bed, eventtime)
         chamber, _ = self._temperature(self.chamber, eventtime)
-        n = nozzle_target or nozzle or 0.
-        b = bed_target or bed or 0.
-        c = chamber or 0.
-        # Conservative broad classes. ABS vs ASA cannot reliably be separated
-        # by temperature, so the higher configured factor is used.
-        if n >= 235. and b >= 90.:
-            material = "ABS"
-            if self.material_factors.get("ASA", 0) > self.material_factors["ABS"]:
-                material = "ASA"
-            return material
-        if n >= 245. and b < 90.:
-            return "PETG"
-        if n >= 225. and b >= 65.:
-            return "PETG"
-        if 180. <= n <= 235. and b <= 70. and c < 40.:
-            return "PLA"
-        return "UNKNOWN"
+
+        n = nozzle_target if nozzle_target and nozzle_target > 0. else (nozzle or 0.)
+        b = bed_target if bed_target and bed_target > 0. else (bed or 0.)
+        c = chamber
+
+        if n < 170.:
+            return "UNKNOWN", []
+
+        candidates = []
+        for material, profile in MATERIAL_PROFILES.items():
+            if material == "UNKNOWN":
+                continue
+            if not self._in_range(n, profile["nozzle"]):
+                continue
+            if not self._in_range(b, profile["bed"]):
+                continue
+            if c is not None and not self._in_range(c, profile["chamber"]):
+                continue
+            candidates.append(material)
+
+        if not candidates:
+            return "UNKNOWN", []
+
+        candidates.sort(
+            key=lambda name: MATERIAL_PROFILES[name]["voc_mg_h"], reverse=True)
+        return candidates[0], candidates
 
     def _fan_state(self, eventtime):
-        total = 0.
         speeds = {}
-        max_total = 0.
+        rpms = {}
+        weighted_fraction = 0.
+        cfm_total = 0.
+        cfm_known = True
+
         for spec, obj in self.fans:
             try:
-                speed = float(obj.get_status(eventtime).get("speed", 0.))
+                status = obj.get_status(eventtime)
+                speed = float(status.get("speed", 0.))
+                rpm = status.get("rpm")
             except Exception:
                 logging.exception("Carbon monitor: fan read failed")
-                speed = 0.
+                speed, rpm = 0., None
             speed = max(0., min(1., speed))
             speeds[spec["alias"]] = speed
-            total += self._curve_cfm(spec["alias"], speed)
-            max_total += self._curve_cfm(spec["alias"], 1.)
-        return total, max_total, speeds
+            rpms[spec["alias"]] = rpm
+            flow_fraction = self._flow_fraction(spec["alias"], speed)
+            weighted_fraction += flow_fraction
+            if spec["cfm"] is None:
+                cfm_known = False
+            else:
+                cfm_total += spec["cfm"] * flow_fraction
 
-    def _capacity_seconds(self):
-        mass_units = self.carbon_mass_g / 100.
-        return self.capacity_hours_per_100g * mass_units * 3600.
+        airflow_fraction = weighted_fraction / float(len(self.fans))
+        return airflow_fraction, (cfm_total if cfm_known else None), speeds, rpms
 
     def _remaining_fraction(self):
-        cap = self._capacity_seconds()
-        return max(0., min(1., 1. - self.weighted_fullflow_seconds / cap))
+        capacity = self.service_life_hours * 3600.
+        return max(0., min(1., 1. - self.service_usage_seconds / capacity))
 
-    def _record_daily_usage(self, epoch, weighted_seconds):
+    def _record_daily_usage(self, epoch, service_seconds):
         day = time.strftime("%Y-%m-%d", time.localtime(epoch))
-        self.daily_usage[day] = self.daily_usage.get(day, 0.) + weighted_seconds
+        self.daily_usage[day] = self.daily_usage.get(day, 0.) + service_seconds
         cutoff = epoch - int(max(30., self.projection_window_days * 2.) * 86400)
         self.daily_usage = {
-            k: v for k, v in self.daily_usage.items()
-            if self._date_epoch(k) >= cutoff
+            key: value for key, value in self.daily_usage.items()
+            if self._date_epoch(key) >= cutoff
         }
 
-    def _date_epoch(self, value):
+    @staticmethod
+    def _date_epoch(value):
         try:
             return int(time.mktime(time.strptime(value, "%Y-%m-%d")))
         except Exception:
@@ -244,41 +336,65 @@ class ActivatedCarbonMonitor:
     def _projection(self):
         now = int(time.time())
         cutoff = now - int(self.projection_window_days * 86400)
-        used = sum(v for k, v in self.daily_usage.items()
-                   if self._date_epoch(k) >= cutoff)
+        recent_usage = sum(
+            value for key, value in self.daily_usage.items()
+            if self._date_epoch(key) >= cutoff)
         elapsed_days = max(1., min(
             self.projection_window_days,
             max(1., (now - self.installed_at) / 86400.)))
-        per_day = used / elapsed_days
-        remaining = max(0., self._capacity_seconds() -
-                        self.weighted_fullflow_seconds)
+        per_day = recent_usage / elapsed_days
+        remaining = max(
+            0., self.service_life_hours * 3600. - self.service_usage_seconds)
         if per_day <= 0.:
             return None, None
         days = remaining / per_day
-        return days, now + int(days * 86400)
+        return days, now + int(days * 86400.)
 
     def _sample(self, eventtime):
         if self.last_sample is None:
             self.last_sample = eventtime
             return eventtime + self.sample_interval
+
         elapsed = max(0., eventtime - self.last_sample)
         self.last_sample = eventtime
+        epoch = int(time.time())
 
-        airflow, max_airflow, speeds = self._fan_state(eventtime)
-        self.current_airflow_cfm = airflow
+        airflow_fraction, airflow_cfm, speeds, rpms = self._fan_state(eventtime)
+        self.current_airflow_fraction = airflow_fraction
+        self.current_airflow_cfm = airflow_cfm
         self.current_fan_speeds = speeds
-        if self.material_source == "inferred":
-            self.current_material = self._infer_material(eventtime)
-        factor = self.material_factors.get(
-            self.current_material, self.material_factors["UNKNOWN"])
+        self.current_fan_rpms = rpms
 
-        if airflow > 0.:
+        if self.material_source == "inferred":
+            self.current_material, _ = self._infer_material(eventtime)
+
+        profile = MATERIAL_PROFILES.get(
+            self.current_material, MATERIAL_PROFILES["UNKNOWN"])
+        printing = self._is_printing(eventtime)
+        voc_rate = profile["voc_mg_h"] if printing else 0.
+        self.current_voc_rate_mg_h = voc_rate
+
+        if printing and elapsed > 0.:
+            generated = voc_rate * elapsed / 3600.
+            self.estimated_voc_generated_mg += generated
+            self.voc_by_material_mg[self.current_material] = (
+                self.voc_by_material_mg.get(self.current_material, 0.) + generated)
+            filtered = generated * airflow_fraction
+            self.estimated_voc_filtered_mg += filtered
+
+        if airflow_fraction > 0. and elapsed > 0.:
             self.active_seconds += elapsed
-            self.air_processed_ft3 += airflow * elapsed / 60.
-            flow_fraction = airflow / max_airflow if max_airflow > 0. else 0.
-            weighted = elapsed * flow_fraction * factor
-            self.weighted_fullflow_seconds += weighted
-            self._record_daily_usage(int(time.time()), weighted)
+            if airflow_cfm is not None:
+                self.air_processed_ft3 += airflow_cfm * elapsed / 60.
+
+            if printing:
+                voc_load = max(
+                    self.background_load, voc_rate / REFERENCE_VOC_MG_H)
+            else:
+                voc_load = self.background_load
+            service_seconds = elapsed * airflow_fraction * voc_load
+            self.service_usage_seconds += service_seconds
+            self._record_daily_usage(epoch, service_seconds)
 
         if eventtime - self.last_save >= self.save_interval:
             self._save_state()
@@ -294,22 +410,28 @@ class ActivatedCarbonMonitor:
         except Exception:
             logging.exception("Carbon monitor: state load failed")
             data = {}
-        self.active_seconds = float(data.get("active_seconds", 0.))
-        self.weighted_fullflow_seconds = float(
-            data.get("weighted_fullflow_seconds",
-                     data.get("equivalent_seconds", 0.)))
-        self.air_processed_ft3 = float(data.get("air_processed_ft3", 0.))
+
         self.installed_at = int(data.get("installed_at", int(time.time())))
+        self.active_seconds = float(data.get("active_seconds", 0.))
+        self.service_usage_seconds = float(data.get(
+            "service_usage_seconds",
+            data.get("weighted_fullflow_seconds", 0.)))
+        self.estimated_voc_generated_mg = float(
+            data.get("estimated_voc_generated_mg", 0.))
+        self.estimated_voc_filtered_mg = float(
+            data.get("estimated_voc_filtered_mg", 0.))
+        self.air_processed_ft3 = float(data.get("air_processed_ft3", 0.))
         self.current_material = str(data.get("current_material", "UNKNOWN"))
         self.material_source = str(data.get("material_source", "inferred"))
         self.history = list(data.get("history", []))
         self.daily_usage = dict(data.get("daily_usage", {}))
+        self.voc_by_material_mg = dict(data.get("voc_by_material_mg", {}))
 
     def _save_state(self):
         directory = os.path.dirname(self.state_file)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        root = {"version": 2, "filters": {}}
+        root = {"version": 3, "filters": {}}
         try:
             with open(self.state_file, "r", encoding="utf-8") as fh:
                 existing = json.load(fh)
@@ -319,16 +441,20 @@ class ActivatedCarbonMonitor:
             pass
         except Exception:
             logging.exception("Carbon monitor: existing state read failed")
-        root["version"] = 2
+
+        root["version"] = 3
         filters = root.setdefault("filters", {})
         filters[self.name] = {
             "installed_at": self.installed_at,
             "active_seconds": self.active_seconds,
-            "weighted_fullflow_seconds": self.weighted_fullflow_seconds,
+            "service_usage_seconds": self.service_usage_seconds,
+            "estimated_voc_generated_mg": self.estimated_voc_generated_mg,
+            "estimated_voc_filtered_mg": self.estimated_voc_filtered_mg,
             "air_processed_ft3": self.air_processed_ft3,
             "current_material": self.current_material,
             "material_source": self.material_source,
             "daily_usage": self.daily_usage,
+            "voc_by_material_mg": self.voc_by_material_mg,
             "history": self.history,
             "updated_at": int(time.time()),
         }
@@ -343,59 +469,88 @@ class ActivatedCarbonMonitor:
 
     def get_status(self, eventtime):
         remaining = self._remaining_fraction()
-        days, epoch = self._projection()
+        days, replacement_epoch = self._projection()
+        inferred_candidates = []
+        if self.material_source == "inferred":
+            _, inferred_candidates = self._infer_material(eventtime)
         return {
             "remaining_percent": round(remaining * 100., 2),
             "used_percent": round((1. - remaining) * 100., 2),
             "installed_at": self.installed_at,
             "age_days": round(max(0., time.time() - self.installed_at) / 86400., 2),
             "active_hours": round(self.active_seconds / 3600., 3),
-            "weighted_fullflow_hours": round(
-                self.weighted_fullflow_seconds / 3600., 3),
-            "air_processed_ft3": round(self.air_processed_ft3, 1),
-            "current_airflow_cfm": round(self.current_airflow_cfm, 2),
-            "fan_speeds": dict(self.current_fan_speeds),
+            "service_usage_hours": round(self.service_usage_seconds / 3600., 3),
+            "service_life_hours": self.service_life_hours,
             "current_material": self.current_material,
             "material_source": self.material_source,
-            "material_factor": self.material_factors.get(
-                self.current_material, self.material_factors["UNKNOWN"]),
-            "carbon_mass_g": self.carbon_mass_g,
-            "carbon_form": self.carbon_form,
+            "material_candidates": inferred_candidates,
+            "estimated_voc_rate_mg_h": round(self.current_voc_rate_mg_h, 3),
+            "estimated_voc_generated_mg": round(self.estimated_voc_generated_mg, 3),
+            "estimated_voc_filtered_mg": round(self.estimated_voc_filtered_mg, 3),
+            "voc_by_material_mg": dict(self.voc_by_material_mg),
+            "current_airflow_fraction": round(self.current_airflow_fraction, 3),
+            "current_airflow_cfm": (
+                None if self.current_airflow_cfm is None
+                else round(self.current_airflow_cfm, 2)),
+            "fan_speeds": dict(self.current_fan_speeds),
+            "fan_rpms": dict(self.current_fan_rpms),
+            "air_processed_ft3": (
+                None if all(spec["cfm"] is None for spec in self.fan_specs)
+                else round(self.air_processed_ft3, 1)),
             "estimated_days_remaining": None if days is None else round(days, 1),
-            "projected_replacement_at": epoch,
+            "projected_replacement_at": replacement_epoch,
         }
 
     def cmd_CARBON_STATUS(self, gcmd):
-        s = self.get_status(self.reactor.monotonic())
+        status = self.get_status(self.reactor.monotonic())
         replacement = "insufficient usage history"
-        if s["projected_replacement_at"]:
+        if status["projected_replacement_at"]:
             replacement = time.strftime(
-                "%Y-%m-%d", time.localtime(s["projected_replacement_at"]))
+                "%Y-%m-%d",
+                time.localtime(status["projected_replacement_at"]))
+        airflow = "%.0f%%" % (status["current_airflow_fraction"] * 100.)
+        if status["current_airflow_cfm"] is not None:
+            airflow += " / %.2f CFM" % status["current_airflow_cfm"]
         gcmd.respond_info(
-            ("Activated carbon '%s'\nRemaining: %.2f%%\nMaterial: %s (%s, x%.2f)"
-             "\nAirflow: %.2f CFM\nActive: %.2f h\nWeighted usage: %.2f h"
-             "\nAir processed: %.0f ft3\nProjected replacement: %s")
-            % (self.name, s["remaining_percent"], s["current_material"],
-               s["material_source"], s["material_factor"],
-               s["current_airflow_cfm"], s["active_hours"],
-               s["weighted_fullflow_hours"], s["air_processed_ft3"],
+            ("Activated carbon '%s'\n"
+             "Remaining: %.2f%%\n"
+             "Material: %s (%s)\n"
+             "Projected TVOC: %.3f mg/h\n"
+             "Estimated TVOC generated: %.2f mg\n"
+             "Filter airflow: %s\n"
+             "Service usage: %.2f / %.2f h\n"
+             "Projected replacement: %s")
+            % (self.name, status["remaining_percent"],
+               status["current_material"], status["material_source"],
+               status["estimated_voc_rate_mg_h"],
+               status["estimated_voc_generated_mg"], airflow,
+               status["service_usage_hours"], status["service_life_hours"],
                replacement))
 
     def cmd_CARBON_SET_MATERIAL(self, gcmd):
         material = gcmd.get("MATERIAL").strip().upper()
-        if material not in self.material_factors:
+        if material == "NYLON":
+            material = "PA"
+        if material not in MATERIAL_PROFILES or material == "UNKNOWN":
             raise gcmd.error("Unknown MATERIAL '%s'" % material)
         self.current_material = material
         self.material_source = "manual"
         self._save_state()
-        gcmd.respond_info("Carbon material override: %s" % material)
+        gcmd.respond_info(
+            "Carbon material override: %s (%.2f mg/h TVOC baseline)" %
+            (material, MATERIAL_PROFILES[material]["voc_mg_h"]))
 
     def cmd_CARBON_AUTO_MATERIAL(self, gcmd):
         self.material_source = "inferred"
-        self.current_material = self._infer_material(self.reactor.monotonic())
+        self.current_material, candidates = self._infer_material(
+            self.reactor.monotonic())
         self._save_state()
-        gcmd.respond_info("Carbon material inference enabled: %s" %
-                          self.current_material)
+        suffix = ""
+        if len(candidates) > 1:
+            suffix = " (conservative choice from %s)" % ", ".join(candidates)
+        gcmd.respond_info(
+            "Carbon material inference enabled: %s%s" %
+            (self.current_material, suffix))
 
     def cmd_CARBON_REPLACE(self, gcmd):
         now = int(time.time())
@@ -403,15 +558,21 @@ class ActivatedCarbonMonitor:
             "installed_at": self.installed_at,
             "replaced_at": now,
             "active_seconds": self.active_seconds,
-            "weighted_fullflow_seconds": self.weighted_fullflow_seconds,
+            "service_usage_seconds": self.service_usage_seconds,
+            "estimated_voc_generated_mg": self.estimated_voc_generated_mg,
+            "estimated_voc_filtered_mg": self.estimated_voc_filtered_mg,
             "air_processed_ft3": self.air_processed_ft3,
+            "voc_by_material_mg": dict(self.voc_by_material_mg),
             "remaining_percent": round(self._remaining_fraction() * 100., 2),
         })
         self.installed_at = now
         self.active_seconds = 0.
-        self.weighted_fullflow_seconds = 0.
+        self.service_usage_seconds = 0.
+        self.estimated_voc_generated_mg = 0.
+        self.estimated_voc_filtered_mg = 0.
         self.air_processed_ft3 = 0.
         self.daily_usage = {}
+        self.voc_by_material_mg = {}
         self.material_source = "inferred"
         self.current_material = "UNKNOWN"
         self._save_state()
