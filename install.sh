@@ -5,28 +5,32 @@ PROJECT_NAME="klipper-activated_carbon_monitor"
 UPDATE_MANAGER_NAME="activated-carbon-monitor"
 MODULE_NAME="activated_carbon_monitor.py"
 DEFAULT_KLIPPER_DIR="${HOME}/klipper"
+DEFAULT_MOONRAKER_DIR="${HOME}/moonraker"
 DEFAULT_MOONRAKER_CONF="${HOME}/printer_data/config/moonraker.conf"
 
 KLIPPER_DIR="${KLIPPER_DIR:-$DEFAULT_KLIPPER_DIR}"
+MOONRAKER_DIR="${MOONRAKER_DIR:-$DEFAULT_MOONRAKER_DIR}"
 MOONRAKER_CONF="${MOONRAKER_CONF:-$DEFAULT_MOONRAKER_CONF}"
 
 usage() {
     cat <<USAGE
-Usage: $0 [-k KLIPPER_DIR] [-m MOONRAKER_CONF]
+Usage: $0 [-k KLIPPER_DIR] [-r MOONRAKER_DIR] [-m MOONRAKER_CONF]
 
-Installs ${PROJECT_NAME} as a Klipper extra and registers the repository
-with Moonraker's update manager.
+Installs ${PROJECT_NAME} as a Klipper extra and Moonraker companion,
+then registers the repository with Moonraker's update manager.
 
 Options:
   -k DIR   Klipper source directory (default: ~/klipper)
+  -r DIR   Moonraker source directory (default: ~/moonraker)
   -m FILE  moonraker.conf path (default: ~/printer_data/config/moonraker.conf)
   -h       Show this help
 USAGE
 }
 
-while getopts ":k:m:h" opt; do
+while getopts ":k:r:m:h" opt; do
     case "$opt" in
         k) KLIPPER_DIR="$OPTARG" ;;
+        r) MOONRAKER_DIR="$OPTARG" ;;
         m) MOONRAKER_CONF="$OPTARG" ;;
         h) usage; exit 0 ;;
         :) echo "Option -$OPTARG requires an argument" >&2; exit 2 ;;
@@ -35,15 +39,21 @@ while getopts ":k:m:h" opt; do
 done
 
 if [[ ${EUID} -eq 0 ]]; then
-    echo "Do not run this installer as root. Run it as the same user that owns Klipper." >&2
+    echo "Do not run this installer as root. Run it as the same user that owns Klipper and Moonraker." >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$SCRIPT_DIR"
-SOURCE_FILE="${REPO_DIR}/klippy/extras/${MODULE_NAME}"
+
+KLIPPER_SOURCE="${REPO_DIR}/klippy/extras/${MODULE_NAME}"
 KLIPPER_EXTRAS="${KLIPPER_DIR}/klippy/extras"
-TARGET_FILE="${KLIPPER_EXTRAS}/${MODULE_NAME}"
+KLIPPER_TARGET="${KLIPPER_EXTRAS}/${MODULE_NAME}"
+
+MOONRAKER_SOURCE="${REPO_DIR}/moonraker/components/${MODULE_NAME}"
+MOONRAKER_COMPONENTS="${MOONRAKER_DIR}/moonraker/components"
+MOONRAKER_TARGET="${MOONRAKER_COMPONENTS}/${MODULE_NAME}"
+
 MOONRAKER_CONFIG_DIR="$(cd "$(dirname "$MOONRAKER_CONF")" && pwd)"
 MANAGER_CONF="${MOONRAKER_CONFIG_DIR}/${PROJECT_NAME}.conf"
 INCLUDE_LINE="[include ${PROJECT_NAME}.conf]"
@@ -54,14 +64,25 @@ if [[ ! -d "${REPO_DIR}/.git" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$SOURCE_FILE" ]]; then
-    echo "Plugin module not found: $SOURCE_FILE" >&2
+if [[ ! -f "$KLIPPER_SOURCE" ]]; then
+    echo "Klipper plugin module not found: $KLIPPER_SOURCE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$MOONRAKER_SOURCE" ]]; then
+    echo "Moonraker companion module not found: $MOONRAKER_SOURCE" >&2
     exit 1
 fi
 
 if [[ ! -d "$KLIPPER_EXTRAS" ]]; then
     echo "Klipper extras directory not found: $KLIPPER_EXTRAS" >&2
     echo "Use -k to specify the Klipper source directory." >&2
+    exit 1
+fi
+
+if [[ ! -d "$MOONRAKER_COMPONENTS" ]]; then
+    echo "Moonraker components directory not found: $MOONRAKER_COMPONENTS" >&2
+    echo "Use -r to specify the Moonraker source directory." >&2
     exit 1
 fi
 
@@ -82,24 +103,40 @@ if [[ -z "$BRANCH" ]]; then
     BRANCH="main"
 fi
 
-printf 'Linking Klipper module...\n'
-if [[ -e "$TARGET_FILE" && ! -L "$TARGET_FILE" ]]; then
-    BACKUP="${TARGET_FILE}.backup.$(date +%Y%m%d%H%M%S)"
-    echo "Existing non-symlink module found; moving it to: $BACKUP"
-    mv "$TARGET_FILE" "$BACKUP"
-fi
-ln -sfn "$SOURCE_FILE" "$TARGET_FILE"
+link_module() {
+    local source="$1"
+    local target="$2"
+    local label="$3"
 
-printf 'Registering Moonraker update manager...\n'
+    if [[ -e "$target" && ! -L "$target" ]]; then
+        local backup="${target}.backup.$(date +%Y%m%d%H%M%S)"
+        echo "Existing non-symlink ${label} module found; moving it to: $backup"
+        mv "$target" "$backup"
+    fi
+
+    ln -sfn "$source" "$target"
+    echo "Linked ${label}: $target -> $source"
+}
+
+printf 'Linking plugin modules...\n'
+link_module "$KLIPPER_SOURCE" "$KLIPPER_TARGET" "Klipper"
+link_module "$MOONRAKER_SOURCE" "$MOONRAKER_TARGET" "Moonraker"
+
+printf 'Registering Moonraker component and update manager...\n'
 cat > "$MANAGER_CONF" <<EOF_MANAGER
 # Managed by ${PROJECT_NAME}/install.sh
+
+[activated_carbon_monitor]
+sensor_name: activated_carbon
+friendly_name: Activated Carbon
+
 [update_manager ${UPDATE_MANAGER_NAME}]
 type: git_repo
 channel: dev
 path: ${REPO_DIR}
 origin: ${ORIGIN}
 primary_branch: ${BRANCH}
-managed_services: klipper
+managed_services: klipper moonraker
 info_tags:
     desc=Klipper Activated Carbon Monitor
 EOF_MANAGER
@@ -119,15 +156,20 @@ restart_if_present() {
     fi
 }
 
-restart_if_present moonraker
+# Klipper first so Moonraker sees the new object when it reconnects.
 restart_if_present klipper
+restart_if_present moonraker
 
 echo
 echo "Installation complete."
-echo "Klipper module: $TARGET_FILE -> $SOURCE_FILE"
-echo "Moonraker update config: $MANAGER_CONF"
+echo "Klipper module:   $KLIPPER_TARGET -> $KLIPPER_SOURCE"
+echo "Moonraker module: $MOONRAKER_TARGET -> $MOONRAKER_SOURCE"
+echo "Moonraker config: $MANAGER_CONF"
 echo
 echo "Next, add the monitor section to printer.cfg, for example:"
 echo
 echo "[activated_carbon_monitor chamber]"
 echo "fans: hepa_left, hepa_right"
+echo
+echo "After Klipper is ready, Mainsail 2.12+ will show an Activated Carbon"
+echo "sensor in the Miscellaneous dashboard panel."
