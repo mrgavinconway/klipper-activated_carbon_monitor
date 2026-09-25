@@ -2,7 +2,7 @@
 
 A Klipper extension that estimates activated-carbon service life from the material being printed and the filtration fans actually running.
 
-The design goal is deliberately simple: for a normal installation the user should only need to identify the filtration fan(s). The plugin derives print state, nozzle/bed temperatures, an optional chamber temperature, the likely filament family, a conservative projected TVOC emission rate, fan duty, carbon burn-down and a replacement projection.
+The design goal is deliberately simple: for a normal installation the user provides the filtration fan names, their full-flow CFM, and the amount of activated carbon installed. The plugin derives print state, nozzle/bed temperatures, an optional chamber temperature, the likely filament family, a conservative projected TVOC emission rate, fan duty, carbon burn-down and a replacement projection.
 
 > This is an estimated service-life model. It is not a direct measurement of VOC concentration or activated-carbon saturation.
 
@@ -11,9 +11,15 @@ The design goal is deliberately simple: for a normal installation the user shoul
 ```ini
 [activated_carbon_monitor chamber]
 fans: hepa_left, hepa_right
+fan_cfm: 5.0, 5.0
+carbon_g: 300
+fan_cfm: 5.0, 5.0
+carbon_g: 300
 ```
 
-That is enough to enable the default model.
+`fan_cfm` follows the same order as `fans`. Use the best estimate of airflow through each installed carbon filter at 100% fan speed; measured loaded-filter airflow is preferable to a free-air datasheet rating.
+
+`carbon_g` is the total mass of activated carbon being tracked by this monitor.
 
 The plugin automatically uses:
 
@@ -23,7 +29,8 @@ The plugin automatically uses:
 - a temperature sensor whose name contains `chamber` or `enclosure`, when available
 - fan `speed` and `rpm` reported by Klipper
 - built-in material temperature profiles and conservative TVOC baselines
-- a 50-hour equivalent service-life baseline
+- an active-load service capacity of 50 equivalent hours per 100 g of carbon
+- a conservative 60-day calendar-life cap for carbon continuously exposed to air
 - a 14-day rolling usage window for the replacement-date projection
 - persistent state in `~/printer_data/config/activated_carbon_monitor.json`
 
@@ -174,17 +181,20 @@ airflow_curve_voron_aire_right: 0:0 20:0 40:0.25 60:0.55 80:0.80 100:1
 
 The right-hand value is relative airflow from 0 to 1.
 
-### Optional absolute CFM
+### Fan CFM
 
-If the installed filter's actual full-flow CFM is known, append it with `@`:
+Specify one full-flow CFM value for each configured fan:
 
 ```ini
-fans: hepa_left@1.6, hepa_right@1.5
+fans: hepa_left, hepa_right
+fan_cfm: 5.0, 5.0
 ```
 
-This enables absolute `current_airflow_cfm` and `air_processed_ft3`. It is not required for carbon-life tracking.
+This enables absolute `current_airflow_cfm` and `air_processed_ft3`.
 
-Do not use a fan's free-air datasheet CFM unless that is genuinely representative of airflow through the installed carbon cartridge.
+Use airflow through the installed filter if it has been measured. A free-air datasheet CFM is an upper-bound estimate because activated carbon and cartridge geometry add substantial restriction.
+
+The older `hepa_left@5.0` form remains accepted for compatibility, but `fan_cfm` is the documented form.
 
 ## Carbon burn-down model
 
@@ -203,28 +213,38 @@ It then scales carbon service usage by:
 
 When the filter is running outside an active print, a smaller background load is applied because exposed activated carbon continues to age in warm/ambient air.
 
-The default reference service life is 50 equivalent hours. This is intentionally a practical printer-maintenance baseline rather than a conversion from laboratory adsorption capacity in mg/g.
+Active-load capacity scales with the configured amount of carbon. The default is 50 equivalent service hours per 100 g:
+
+```text
+active service capacity =
+    50 h × carbon_g / 100 g
+```
+
+This is intentionally a practical maintenance heuristic rather than a claim that all activated carbon has an identical adsorption capacity.
+
+Carbon also ages while exposed to ambient/chamber air even if the fans are not running. The default calendar limit is 60 days. The monitor uses whichever limit is reached first: active-load exhaustion or calendar exposure.
 
 Optional tuning:
 
 ```ini
-service_life_hours: 50
+service_life_hours_per_100g: 50
+calendar_life_days: 60
 background_load: 0.20
 projection_window_days: 14
 ```
 
 ## Replacement projection
 
-Daily service usage is persisted. The recent rolling usage rate is used to calculate:
+Daily service usage is persisted. The recent rolling usage rate is used to calculate the active-load replacement projection, while the installation date provides a calendar-life projection from the moment new carbon is installed.
+
+The reported replacement date is the **earlier** of:
 
 ```text
-estimated_days_remaining
-projected_replacement_at
+active-load exhaustion
+calendar-life expiry
 ```
 
-A printer used heavily for higher-emitting materials burns down faster than one used occasionally for PLA.
-
-If insufficient usage has been recorded, no date is fabricated.
+This prevents a nearly-new cartridge with only a few minutes of recorded use from producing meaningless multi-decade estimates. With default settings, a newly installed cartridge starts at approximately 60 days remaining and heavy/high-VOC use can pull that date closer.
 
 ## Commands
 
