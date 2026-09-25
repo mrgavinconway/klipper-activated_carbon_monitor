@@ -285,9 +285,11 @@ The installer will:
 3. create a dedicated Moonraker configuration file containing the dashboard bridge and update-manager registration;
 4. add a Moonraker `[include ...]` for that file if it is not already present;
 5. register this Git repository with Moonraker's `git_repo` update manager; and
-6. restart Klipper and Moonraker when their standard systemd services are present.
+6. optionally offer to restart Moonraker and Klipper, with **No** as the default.
 
 The modules are **not copied**. Both Klipper and Moonraker load them through symlinks to the Git checkout, so Moonraker can update the repository in place without a separate reinstall step.
+
+The installer **never restarts Klipper or Moonraker automatically**. In an interactive terminal it asks whether each service should be restarted, defaulting to No. The Klipper prompt explicitly warns that restarting Klipper will stop an active print. In non-interactive use no restart is attempted.
 
 ### Moonraker update management
 
@@ -320,7 +322,7 @@ fans: hepa_left, hepa_right
 
 Replace the fan object names with the actual Klipper objects that move air through your activated carbon.
 
-Then run a Klipper restart.
+When the printer is idle, restart Klipper to load the new module. Restart Moonraker to load the dashboard companion and update-manager entry. The installer can prompt for these restarts, but will not perform them without confirmation.
 
 ### Non-standard installations
 
