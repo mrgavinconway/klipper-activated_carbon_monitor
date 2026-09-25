@@ -148,17 +148,48 @@ if ! grep -Fqx "$INCLUDE_LINE" "$MOONRAKER_CONF"; then
     echo "Backed up moonraker.conf to: $BACKUP"
 fi
 
-restart_if_present() {
+service_exists() {
     local service="$1"
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "${service}.service" --no-legend 2>/dev/null | grep -q "${service}.service"; then
-        echo "Restarting ${service}..."
-        sudo systemctl restart "$service"
-    fi
+    command -v systemctl >/dev/null 2>&1 &&
+        systemctl list-unit-files "${service}.service" --no-legend 2>/dev/null |
+        grep -q "${service}.service"
 }
 
-# Klipper first so Moonraker sees the new object when it reconnects.
-restart_if_present klipper
-restart_if_present moonraker
+prompt_restart() {
+    local service="$1"
+    local warning="$2"
+
+    if ! service_exists "$service"; then
+        return
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "Not restarting ${service}: installer is running non-interactively."
+        return
+    fi
+
+    echo
+    if [[ -n "$warning" ]]; then
+        echo "$warning"
+    fi
+    read -r -p "Restart ${service} now? [y/N] " reply
+    case "$reply" in
+        y|Y|yes|YES|Yes)
+            echo "Restarting ${service}..."
+            sudo systemctl restart "$service"
+            ;;
+        *)
+            echo "Leaving ${service} running."
+            ;;
+    esac
+}
+
+echo
+echo "Installation files are in place."
+echo "No services are restarted automatically."
+
+prompt_restart moonraker "Moonraker must be restarted before its dashboard component and update-manager entry are loaded."
+prompt_restart klipper "WARNING: Restarting Klipper will immediately stop any active print. Only restart when the printer is idle."
 
 echo
 echo "Installation complete."
