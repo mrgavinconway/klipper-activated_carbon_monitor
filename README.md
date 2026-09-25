@@ -10,7 +10,7 @@ The design goal is deliberately simple: for a normal installation the user shoul
 
 ```ini
 [activated_carbon_monitor chamber]
-fans: fan_generic voron_aire_left; fan_generic voron_aire_right
+fans: hepa_left, hepa_right
 ```
 
 That is enough to enable the default model.
@@ -128,11 +128,13 @@ CARBON_AUTO_MATERIAL FILTER=chamber
 
 ## Airflow
 
-By default the plugin needs no fan specification other than the Klipper object names:
+By default the plugin only needs the names of the named `[fan_generic ...]` objects that move air through the carbon:
 
 ```ini
-fans: fan_generic voron_aire_left; fan_generic voron_aire_right
+fans: hepa_left, hepa_right
 ```
+
+Use a comma-separated list, following normal Klipper list-style configuration. Short names are automatically resolved to `fan_generic <name>`, so the example above resolves to `fan_generic hepa_left` and `fan_generic hepa_right`. Full object names are also accepted if needed.
 
 Klipper fan speed is treated as normalized flow unless a better curve is supplied. This deliberately avoids requiring users to know physical CFM just to use the monitor.
 
@@ -152,7 +154,7 @@ The right-hand value is relative airflow from 0 to 1.
 If the installed filter's actual full-flow CFM is known, append it with `@`:
 
 ```ini
-fans: fan_generic voron_aire_left@1.6; fan_generic voron_aire_right@1.5
+fans: hepa_left@1.6, hepa_right@1.5
 ```
 
 This enables absolute `current_airflow_cfm` and `air_processed_ft3`. It is not required for carbon-life tracking.
@@ -284,7 +286,7 @@ After installation, add the minimum section to `printer.cfg`:
 
 ```ini
 [activated_carbon_monitor chamber]
-fans: fan_generic voron_aire_left; fan_generic voron_aire_right
+fans: hepa_left, hepa_right
 ```
 
 Replace the fan object names with the actual Klipper objects that move air through your activated carbon.
