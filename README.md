@@ -74,6 +74,33 @@ Example:
 {printer["activated_carbon_monitor chamber"].estimated_voc_rate_mg_h}
 ```
 
+## Mainsail dashboard
+
+The installer also installs a small Moonraker companion component. It mirrors the numeric carbon-monitor values into Moonraker's native sensor API, which Mainsail 2.12+ displays in the **Miscellaneous** dashboard panel.
+
+No Mainsail fork or custom frontend is required.
+
+The **Activated Carbon** sensor shows values such as:
+
+```text
+Remaining percent
+Used percent
+Projected TVOC mg per h
+Estimated VOC generated mg
+Estimated VOC filtered mg
+Airflow percent
+Airflow CFM              (when absolute CFM is configured)
+Active filter hours
+Service usage hours
+Service life hours
+Carbon age days
+Replacement in days
+```
+
+The inferred material name remains available through the Klipper object and `CARBON_STATUS`. Mainsail's generic Moonraker sensor widget currently accepts numeric measurements, so the bridge does not encode material names such as `ABS` or `ASA` as arbitrary numbers.
+
+Carbon state is shown in **Miscellaneous**, rather than pretending that carbon remaining or VOC load is a temperature. The Klipper object remains the source of truth; Moonraker only mirrors it for the UI.
+
 ## Material inference and projected VOCs
 
 The plugin compares the active nozzle target, bed target and available chamber temperature against built-in material profiles.
@@ -234,6 +261,7 @@ The installer uses the standard locations:
 
 ```text
 ~/klipper
+~/moonraker
 ~/printer_data/config/moonraker.conf
 ```
 
@@ -252,13 +280,14 @@ cd klipper-activated_carbon_monitor
 
 The installer will:
 
-1. create a symlink from the repository's `activated_carbon_monitor.py` into `~/klipper/klippy/extras/`;
-2. create a dedicated Moonraker update-manager configuration file;
-3. add a Moonraker `[include ...]` for that file if it is not already present;
-4. register this Git repository with Moonraker's `git_repo` update manager; and
-5. restart Moonraker and Klipper when their standard systemd services are present.
+1. symlink the Klipper module into `~/klipper/klippy/extras/`;
+2. symlink the Moonraker companion into `~/moonraker/moonraker/components/`;
+3. create a dedicated Moonraker configuration file containing the dashboard bridge and update-manager registration;
+4. add a Moonraker `[include ...]` for that file if it is not already present;
+5. register this Git repository with Moonraker's `git_repo` update manager; and
+6. restart Klipper and Moonraker when their standard systemd services are present.
 
-It does **not** copy the Python module into Klipper. Klipper loads the module through a symlink to the Git checkout, so when Moonraker updates the repository the installed plugin changes with it automatically.
+The modules are **not copied**. Both Klipper and Moonraker load them through symlinks to the Git checkout, so Moonraker can update the repository in place without a separate reinstall step.
 
 ### Moonraker update management
 
@@ -271,10 +300,10 @@ channel: dev
 path: ~/klipper-activated_carbon_monitor
 origin: https://github.com/mrgavinconway/klipper-activated_carbon_monitor.git
 primary_branch: main
-managed_services: klipper
+managed_services: klipper moonraker
 ```
 
-After restarting Moonraker, **Activated Carbon Monitor** should appear in the update section of Mainsail/Fluidd. Updating it there updates the Git checkout in place and Moonraker restarts Klipper afterwards.
+After restarting Moonraker, **Activated Carbon Monitor** should appear in the update section of Mainsail/Fluidd. Updating it there updates the Git checkout in place and Moonraker restarts both Klipper and Moonraker afterwards so changes to either side of the integration are loaded.
 
 The project currently uses Moonraker's `dev` channel because releases have not yet been tagged with semantic versions. Once stable tagged releases are introduced this can move to a stable release channel.
 
@@ -298,7 +327,7 @@ Then run a Klipper restart.
 If Klipper or Moonraker use different paths:
 
 ```bash
-./install.sh -k /path/to/klipper -m /path/to/moonraker.conf
+./install.sh -k /path/to/klipper -r /path/to/moonraker -m /path/to/moonraker.conf
 ```
 
 Run `./install.sh -h` for the available options.
@@ -317,7 +346,7 @@ From the repository:
 ./uninstall.sh
 ```
 
-This removes the Klipper symlink and Moonraker update-manager registration. It deliberately leaves both the Git repository and the persistent carbon-history JSON in place so uninstalling does not destroy historical data.
+This removes both the Klipper and Moonraker module symlinks plus the Moonraker component/update-manager registration. It deliberately leaves both the Git repository and the persistent carbon-history JSON in place so uninstalling does not destroy historical data.
 
 Remove the `[activated_carbon_monitor ...]` section from `printer.cfg` before restarting Klipper.
 
