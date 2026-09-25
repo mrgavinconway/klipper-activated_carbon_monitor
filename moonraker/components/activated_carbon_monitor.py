@@ -45,19 +45,14 @@ class CarbonDashboardSensor:
                 return
             measurements[name] = float(value) * scale
 
-        add("remaining_percent", status.get("remaining_percent"))
         add("used_percent", status.get("used_percent"))
         add("projected_tvoc_mg_per_h", status.get("estimated_voc_rate_mg_h"))
         add("estimated_voc_generated_mg", status.get("estimated_voc_generated_mg"))
         add("estimated_voc_filtered_mg", status.get("estimated_voc_filtered_mg"))
-        add("airflow_percent", status.get("current_airflow_fraction"), 100.0)
         add("airflow_cfm", status.get("current_airflow_cfm"))
         add("active_filter_hours", status.get("active_hours"))
         add("service_usage_hours", status.get("service_usage_hours"))
-        add("service_life_hours", status.get("service_life_hours"))
-        add("carbon_age_days", status.get("age_days"))
         add("replacement_in_days", status.get("estimated_days_remaining"))
-        add("klipper_connected", 1.0 if klipper_connected else 0.0)
 
         self.last_measurements = measurements
         self.error_state = None
@@ -66,8 +61,6 @@ class CarbonDashboardSensor:
         # Keep persistent/service values visible instead of collapsing the
         # Mainsail card to an empty heading during a Klipper restart.
         measurements = dict(self.last_measurements)
-        measurements["klipper_connected"] = 0.0
-        measurements["airflow_percent"] = 0.0
         measurements["projected_tvoc_mg_per_h"] = 0.0
         if "airflow_cfm" in measurements:
             measurements["airflow_cfm"] = 0.0
