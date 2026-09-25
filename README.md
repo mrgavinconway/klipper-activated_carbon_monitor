@@ -224,19 +224,100 @@ History includes:
 
 ## Installation
 
-Copy:
+### Prerequisites
+
+A normal Klipper installation with Moonraker and a web UI such as Mainsail or Fluidd is expected.
+
+The installer uses the standard locations:
 
 ```text
-klippy/extras/activated_carbon_monitor.py
+~/klipper
+~/printer_data/config/moonraker.conf
 ```
 
-into:
+Custom paths are supported with installer options.
 
-```text
-~/klipper/klippy/extras/
+### Install
+
+SSH to the printer host and run:
+
+```bash
+cd ~
+git clone https://github.com/mrgavinconway/klipper-activated_carbon_monitor.git
+cd klipper-activated_carbon_monitor
+./install.sh
 ```
 
-Add the minimum configuration shown above and restart Klipper.
+The installer will:
+
+1. create a symlink from the repository's `activated_carbon_monitor.py` into `~/klipper/klippy/extras/`;
+2. create a dedicated Moonraker update-manager configuration file;
+3. add a Moonraker `[include ...]` for that file if it is not already present;
+4. register this Git repository with Moonraker's `git_repo` update manager; and
+5. restart Moonraker and Klipper when their standard systemd services are present.
+
+It does **not** copy the Python module into Klipper. Klipper loads the module through a symlink to the Git checkout, so when Moonraker updates the repository the installed plugin changes with it automatically.
+
+### Moonraker update management
+
+The installer registers the equivalent of:
+
+```ini
+[update_manager activated-carbon-monitor]
+type: git_repo
+channel: dev
+path: ~/klipper-activated_carbon_monitor
+origin: https://github.com/mrgavinconway/klipper-activated_carbon_monitor.git
+primary_branch: main
+managed_services: klipper
+```
+
+After restarting Moonraker, **Activated Carbon Monitor** should appear in the update section of Mainsail/Fluidd. Updating it there updates the Git checkout in place and Moonraker restarts Klipper afterwards.
+
+The project currently uses Moonraker's `dev` channel because releases have not yet been tagged with semantic versions. Once stable tagged releases are introduced this can move to a stable release channel.
+
+Moonraker's older `install_script:` update-manager option is intentionally not used. Current Moonraker documentation marks it deprecated for new configurations and does not execute the script during updates.
+
+### Configure the filter
+
+After installation, add the minimum section to `printer.cfg`:
+
+```ini
+[activated_carbon_monitor chamber]
+fans: fan_generic voron_aire_left; fan_generic voron_aire_right
+```
+
+Replace the fan object names with the actual Klipper objects that move air through your activated carbon.
+
+Then run a Klipper restart.
+
+### Non-standard installations
+
+If Klipper or Moonraker use different paths:
+
+```bash
+./install.sh -k /path/to/klipper -m /path/to/moonraker.conf
+```
+
+Run `./install.sh -h` for the available options.
+
+### Existing manual installation
+
+If an earlier version of the plugin was copied manually into `klippy/extras`, clone this repository and run `./install.sh`.
+
+The installer backs up an existing non-symlink `activated_carbon_monitor.py` before replacing it with the managed symlink.
+
+### Uninstall
+
+From the repository:
+
+```bash
+./uninstall.sh
+```
+
+This removes the Klipper symlink and Moonraker update-manager registration. It deliberately leaves both the Git repository and the persistent carbon-history JSON in place so uninstalling does not destroy historical data.
+
+Remove the `[activated_carbon_monitor ...]` section from `printer.cfg` before restarting Klipper.
 
 ## Scientific limitations
 
