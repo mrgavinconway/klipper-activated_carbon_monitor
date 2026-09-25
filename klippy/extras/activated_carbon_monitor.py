@@ -108,20 +108,24 @@ class ActivatedCarbonMonitor:
         self.timer = self.reactor.register_timer(self._sample, self.reactor.NEVER)
 
     def _parse_fans(self, raw):
-        """Parse minimal fan list.
+        """Parse a comma-separated list of filtration fans.
 
-        Preferred syntax:
-          fans: fan_generic filter_left; fan_generic filter_right
+        Preferred Klipper-style syntax:
+          fans: hepa_left, hepa_right
 
-        Optional absolute airflow can be provided without changing the simple
-        path:
-          fans: fan_generic filter_left@2.0; fan_generic filter_right@2.0
+        Short names are resolved to named fan_generic objects at connect time.
+        Full Klipper object names remain supported:
+          fans: fan_generic hepa_left, fan_generic hepa_right
 
-        The optional number is estimated full-flow CFM through the installed
-        filter, not free-air fan CFM.
+        Optional absolute full-flow CFM through the installed filter may be
+        appended with '@':
+          fans: hepa_left@2.0, hepa_right@2.0
         """
         specs = []
-        for item in raw.replace("\n", ";").split(";"):
+        # Accept semicolons from early development versions for compatibility,
+        # but document and prefer Klipper's normal comma-separated style.
+        normalized = raw.replace("\n", ",").replace(";", ",")
+        for item in normalized.split(","):
             item = item.strip()
             if not item:
                 continue
@@ -188,10 +192,27 @@ class ActivatedCarbonMonitor:
     def _connect(self):
         self.fans = []
         for spec in self.fan_specs:
-            obj = self.printer.lookup_object(spec["object"], None)
+            requested = spec["object"]
+            candidates = [requested]
+            # Named generic fans are exposed by Klipper as
+            # "fan_generic <name>". Let the user configure just <name>.
+            if " " not in requested:
+                candidates.append("fan_generic " + requested)
+
+            obj = None
+            resolved = None
+            for candidate in candidates:
+                obj = self.printer.lookup_object(candidate, None)
+                if obj is not None:
+                    resolved = candidate
+                    break
+
             if obj is None:
                 raise self.printer.config_error(
-                    "Unable to find filtration fan '%s'" % spec["object"])
+                    "Unable to find filtration fan '%s' "
+                    "(tried: %s)" % (requested, ", ".join(candidates)))
+
+            spec["resolved_object"] = resolved
             self.fans.append((spec, obj))
 
         self.extruder = self.printer.lookup_object(self.extruder_name, None)
