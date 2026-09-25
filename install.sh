@@ -130,4 +130,4 @@ echo
 echo "Next, add the monitor section to printer.cfg, for example:"
 echo
 echo "[activated_carbon_monitor chamber]"
-echo "fans: fan_generic voron_aire_left; fan_generic voron_aire_right"
+echo "fans: hepa_left, hepa_right"
