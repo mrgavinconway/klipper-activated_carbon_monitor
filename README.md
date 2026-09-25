@@ -80,22 +80,20 @@ The installer also installs a small Moonraker companion component. It mirrors th
 
 No Mainsail fork or custom frontend is required.
 
-The **Activated Carbon** sensor shows values such as:
+The **Activated Carbon** sensor intentionally keeps the dashboard concise:
 
 ```text
-Remaining percent
 Used percent
 Projected TVOC mg per h
 Estimated VOC generated mg
 Estimated VOC filtered mg
-Airflow percent
 Airflow CFM              (when absolute CFM is configured)
 Active filter hours
 Service usage hours
-Service life hours
-Carbon age days
 Replacement in days
 ```
+
+Additional internal values remain available through the Klipper status object for calculations, macros and debugging, but are not mirrored into the Mainsail card.
 
 The inferred material name remains available through the Klipper object and `CARBON_STATUS`. Mainsail's generic Moonraker sensor widget currently accepts numeric measurements, so the bridge does not encode material names such as `ABS` or `ASA` as arbitrary numbers.
 
