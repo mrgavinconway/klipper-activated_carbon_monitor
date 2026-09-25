@@ -27,7 +27,9 @@ MATERIAL_PROFILES = {
 }
 
 REFERENCE_VOC_MG_H = MATERIAL_PROFILES["ABS"]["voc_mg_h"]
-DEFAULT_SERVICE_LIFE_HOURS = 50.0
+DEFAULT_SERVICE_LIFE_HOURS_PER_100G = 50.0
+DEFAULT_CARBON_G = 100.0
+DEFAULT_CALENDAR_LIFE_DAYS = 60.0
 DEFAULT_BACKGROUND_LOAD = 0.20
 
 
@@ -42,6 +44,7 @@ class ActivatedCarbonMonitor:
 
         # Minimal configuration is just fans. Everything else has defaults.
         self.fan_specs = self._parse_fans(config.get("fans"))
+        self._apply_fan_cfm(config.get("fan_cfm", None))
         self.airflow_curves = {}
         for spec in self.fan_specs:
             raw_curve = config.get("airflow_curve_" + spec["alias"], None)
@@ -49,8 +52,18 @@ class ActivatedCarbonMonitor:
         self.extruder_name = config.get("extruder", "extruder")
         self.bed_name = config.get("bed", "heater_bed")
         self.chamber_name = config.get("chamber_sensor", None)
-        self.service_life_hours = config.getfloat(
-            "service_life_hours", DEFAULT_SERVICE_LIFE_HOURS, above=0.)
+        self.carbon_g = config.getfloat(
+            "carbon_g", DEFAULT_CARBON_G, above=0.)
+        self.calendar_life_days = config.getfloat(
+            "calendar_life_days", DEFAULT_CALENDAR_LIFE_DAYS, above=0.)
+        self.service_life_hours_per_100g = config.getfloat(
+            "service_life_hours_per_100g",
+            DEFAULT_SERVICE_LIFE_HOURS_PER_100G,
+            above=0.)
+        # Active-load capacity scales with the amount of installed carbon.
+        self.service_life_hours = (
+            self.service_life_hours_per_100g * self.carbon_g / 100.0
+        )
         self.background_load = config.getfloat(
             "background_load", DEFAULT_BACKGROUND_LOAD, minval=0.)
         self.sample_interval = config.getfloat("sample_interval", 5., above=0.)
@@ -148,6 +161,28 @@ class ActivatedCarbonMonitor:
             raise self.printer.config_error(
                 "At least one filtration fan must be listed in 'fans'")
         return specs
+
+    def _apply_fan_cfm(self, raw):
+        """Apply full-flow CFM values in the same order as the fan list."""
+        if raw is None:
+            return
+        values = [
+            item.strip() for item in raw.replace("\n", ",").split(",")
+            if item.strip()
+        ]
+        if len(values) != len(self.fan_specs):
+            raise self.printer.config_error(
+                "fan_cfm must contain one value for each fan in 'fans'")
+        for spec, value in zip(self.fan_specs, values):
+            try:
+                cfm = float(value)
+            except ValueError:
+                raise self.printer.config_error(
+                    "Invalid fan_cfm value '%s'" % value)
+            if cfm <= 0.:
+                raise self.printer.config_error(
+                    "fan_cfm values must be greater than zero")
+            spec["cfm"] = cfm
 
     def _parse_airflow_curve(self, raw):
         """Return PWM->relative-flow points. Default is linear.
@@ -335,8 +370,22 @@ class ActivatedCarbonMonitor:
         return airflow_fraction, (cfm_total if cfm_known else None), speeds, rpms
 
     def _remaining_fraction(self):
-        capacity = self.service_life_hours * 3600.
-        return max(0., min(1., 1. - self.service_usage_seconds / capacity))
+        # Carbon can be retired either through active filtration load or simply
+        # through prolonged exposure to ambient/chamber air. Use whichever
+        # limit is closer to exhaustion.
+        active_capacity = self.service_life_hours * 3600.
+        active_used = (
+            self.service_usage_seconds / active_capacity
+            if active_capacity > 0. else 1.0
+        )
+        age_seconds = max(0., time.time() - self.installed_at)
+        calendar_capacity = self.calendar_life_days * 86400.
+        calendar_used = (
+            age_seconds / calendar_capacity
+            if calendar_capacity > 0. else 1.0
+        )
+        used = max(active_used, calendar_used)
+        return max(0., min(1., 1. - used))
 
     def _record_daily_usage(self, epoch, service_seconds):
         day = time.strftime("%Y-%m-%d", time.localtime(epoch))
@@ -356,6 +405,15 @@ class ActivatedCarbonMonitor:
 
     def _projection(self):
         now = int(time.time())
+
+        # Calendar exposure provides a useful projection from day one and also
+        # prevents tiny early usage samples producing absurd multi-decade
+        # replacement estimates.
+        calendar_expiry = (
+            self.installed_at + int(self.calendar_life_days * 86400.)
+        )
+        calendar_days = max(0., (calendar_expiry - now) / 86400.)
+
         cutoff = now - int(self.projection_window_days * 86400)
         recent_usage = sum(
             value for key, value in self.daily_usage.items()
@@ -364,12 +422,17 @@ class ActivatedCarbonMonitor:
             self.projection_window_days,
             max(1., (now - self.installed_at) / 86400.)))
         per_day = recent_usage / elapsed_days
-        remaining = max(
+        remaining_active = max(
             0., self.service_life_hours * 3600. - self.service_usage_seconds)
-        if per_day <= 0.:
-            return None, None
-        days = remaining / per_day
-        return days, now + int(days * 86400.)
+
+        usage_days = None
+        if per_day > 0.:
+            usage_days = remaining_active / per_day
+
+        if usage_days is None or calendar_days <= usage_days:
+            return calendar_days, calendar_expiry
+
+        return usage_days, now + int(usage_days * 86400.)
 
     def _sample(self, eventtime):
         if self.last_sample is None:
@@ -502,6 +565,9 @@ class ActivatedCarbonMonitor:
             "active_hours": round(self.active_seconds / 3600., 3),
             "service_usage_hours": round(self.service_usage_seconds / 3600., 3),
             "service_life_hours": self.service_life_hours,
+            "service_life_hours_per_100g": self.service_life_hours_per_100g,
+            "carbon_g": self.carbon_g,
+            "calendar_life_days": self.calendar_life_days,
             "current_material": self.current_material,
             "material_source": self.material_source,
             "material_candidates": inferred_candidates,
@@ -585,6 +651,8 @@ class ActivatedCarbonMonitor:
             "air_processed_ft3": self.air_processed_ft3,
             "voc_by_material_mg": dict(self.voc_by_material_mg),
             "remaining_percent": round(self._remaining_fraction() * 100., 2),
+            "carbon_g": self.carbon_g,
+            "calendar_life_days": self.calendar_life_days,
         })
         self.installed_at = now
         self.active_seconds = 0.
