@@ -33,7 +33,9 @@ class CarbonDashboardSensor:
         logging.info("Registered activated carbon dashboard sensor '%s'", self.name)
         return True
 
-    def set_status(self, status: Dict[str, Any]) -> None:
+    def set_status(
+        self, status: Dict[str, Any], klipper_connected: bool = True
+    ) -> None:
         measurements: Dict[str, Number] = {}
 
         def add(name: str, value: Any, scale: float = 1.0) -> None:
@@ -55,12 +57,21 @@ class CarbonDashboardSensor:
         add("service_life_hours", status.get("service_life_hours"))
         add("carbon_age_days", status.get("age_days"))
         add("replacement_in_days", status.get("estimated_days_remaining"))
+        add("klipper_connected", 1.0 if klipper_connected else 0.0)
 
         self.last_measurements = measurements
         self.error_state = None
 
-    def clear(self, error: Optional[str] = None) -> None:
-        self.last_measurements = {}
+    def mark_disconnected(self, error: Optional[str] = None) -> None:
+        # Keep persistent/service values visible instead of collapsing the
+        # Mainsail card to an empty heading during a Klipper restart.
+        measurements = dict(self.last_measurements)
+        measurements["klipper_connected"] = 0.0
+        measurements["airflow_percent"] = 0.0
+        measurements["projected_tvoc_mg_per_h"] = 0.0
+        if "airflow_cfm" in measurements:
+            measurements["airflow_cfm"] = 0.0
+        self.last_measurements = measurements
         self.error_state = error
 
     def _update_sensor_value(self, eventtime: float) -> None:
@@ -101,6 +112,9 @@ class ActivatedCarbonMonitorBridge:
         self.preferred_object = config.get("klipper_object", None)
         self.object_name: Optional[str] = None
         self.callback_registered = False
+        # Klipper subscription callbacks contain deltas, not complete objects.
+        # Keep a full cached copy so Mainsail always receives a stable sensor.
+        self.klipper_status: Dict[str, Any] = {}
 
         store_size = config.getint("sensor_store_size", 1200, minval=60)
         self.sensor = CarbonDashboardSensor(
@@ -133,7 +147,7 @@ class ActivatedCarbonMonitorBridge:
 
         if self.preferred_object:
             if self.preferred_object not in candidates:
-                self.sensor.clear(
+                self.sensor.mark_disconnected(
                     "Configured Klipper carbon monitor object not found"
                 )
                 self.server.add_warning(
@@ -147,7 +161,9 @@ class ActivatedCarbonMonitorBridge:
         elif candidates:
             selected = candidates[0]
         else:
-            self.sensor.clear("No activated_carbon_monitor Klipper object found")
+            self.sensor.mark_disconnected(
+                "No activated_carbon_monitor Klipper object found"
+            )
             self.server.add_warning(
                 "Activated Carbon Monitor: no [activated_carbon_monitor ...] "
                 "section was found in Klipper"
@@ -164,7 +180,8 @@ class ActivatedCarbonMonitorBridge:
             {selected: None}, callback=callback, default={}
         )
         if selected in initial:
-            self.sensor.set_status(initial[selected])
+            self.klipper_status = dict(initial[selected])
+            self.sensor.set_status(self.klipper_status, klipper_connected=True)
 
         logging.info(
             "Activated Carbon Monitor dashboard bridge using Klipper object '%s'",
@@ -178,13 +195,16 @@ class ActivatedCarbonMonitorBridge:
             return
         update = status.get(self.object_name)
         if update is not None:
-            self.sensor.set_status(update)
+            self.klipper_status.update(update)
+            self.sensor.set_status(
+                self.klipper_status, klipper_connected=True
+            )
 
     async def _handle_klippy_disconnect(self) -> None:
-        self.sensor.clear("Klipper disconnected")
+        self.sensor.mark_disconnected("Klipper disconnected")
 
     async def _handle_klippy_shutdown(self) -> None:
-        self.sensor.clear("Klipper shutdown")
+        self.sensor.mark_disconnected("Klipper shutdown")
 
     def close(self) -> None:
         self.sensor.close()
