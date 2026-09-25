@@ -193,3 +193,37 @@ That would allow real cartridge behaviour to calibrate:
 - replacement thresholds
 
 Until then the plugin should continue to label all calculated VOC and carbon-life values as estimates.
+
+## Calendar exposure and the 60-day default
+
+Activated carbon can accumulate contaminants while simply exposed to ambient air; it does not require the filtration fan to be running for every adsorption event.
+
+Nevermore's Micro documentation specifically warns that carbon exposed to air can become depleted on the order of **1–2 months**, even when the filter is not actively used:
+
+https://github.com/nevermore3d/Nevermore_Micro
+
+The plugin therefore uses a conservative default:
+
+```text
+calendar_life_days: 60
+```
+
+This is a maintenance bound rather than a universal chemical saturation time. Real passive life depends on storage, ambient VOC concentration, humidity, carbon chemistry, exposed surface area and enclosure conditions. Carbon stored sealed from ambient air should not be treated the same as carbon installed openly in a printer.
+
+The replacement projection uses the earlier of:
+
+- active-load exhaustion; or
+- calendar-life expiry.
+
+This also prevents very small initial usage samples from extrapolating to implausible multi-year replacement intervals.
+
+## Carbon mass and airflow inputs
+
+The plugin asks for carbon mass because a larger carbon bed has more adsorption capacity than a smaller one. Active service capacity is currently scaled linearly with `carbon_g` using a configurable maintenance heuristic of 50 equivalent service hours per 100 g.
+
+That scaling is intentionally labelled a heuristic: laboratory adsorption capacities such as benzene adsorption cannot be converted directly into real mixed-VOC printer lifetime without knowing concentration, humidity, temperature, competing compounds and residence time.
+
+The plugin also accepts one full-flow CFM value per filtration fan. The useful number is airflow through the **installed carbon cartridge**, not unrestricted free-air fan CFM. Carbon media and cartridge geometry can impose substantial pressure loss.
+
+Absolute CFM is used to report current airflow and accumulated air volume. The carbon loading model does not claim that doubling CFM doubles VOC generation or adsorption capacity.
+
