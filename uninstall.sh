@@ -4,16 +4,19 @@ set -euo pipefail
 PROJECT_NAME="klipper-activated_carbon_monitor"
 MODULE_NAME="activated_carbon_monitor.py"
 DEFAULT_KLIPPER_DIR="${HOME}/klipper"
+DEFAULT_MOONRAKER_DIR="${HOME}/moonraker"
 DEFAULT_MOONRAKER_CONF="${HOME}/printer_data/config/moonraker.conf"
 
 KLIPPER_DIR="${KLIPPER_DIR:-$DEFAULT_KLIPPER_DIR}"
+MOONRAKER_DIR="${MOONRAKER_DIR:-$DEFAULT_MOONRAKER_DIR}"
 MOONRAKER_CONF="${MOONRAKER_CONF:-$DEFAULT_MOONRAKER_CONF}"
 
-while getopts ":k:m:h" opt; do
+while getopts ":k:r:m:h" opt; do
     case "$opt" in
         k) KLIPPER_DIR="$OPTARG" ;;
+        r) MOONRAKER_DIR="$OPTARG" ;;
         m) MOONRAKER_CONF="$OPTARG" ;;
-        h) echo "Usage: $0 [-k KLIPPER_DIR] [-m MOONRAKER_CONF]"; exit 0 ;;
+        h) echo "Usage: $0 [-k KLIPPER_DIR] [-r MOONRAKER_DIR] [-m MOONRAKER_CONF]"; exit 0 ;;
         :) echo "Option -$OPTARG requires an argument" >&2; exit 2 ;;
         \?) echo "Unknown option: -$OPTARG" >&2; exit 2 ;;
     esac
@@ -24,17 +27,25 @@ if [[ ${EUID} -eq 0 ]]; then
     exit 1
 fi
 
-TARGET_FILE="${KLIPPER_DIR}/klippy/extras/${MODULE_NAME}"
+KLIPPER_TARGET="${KLIPPER_DIR}/klippy/extras/${MODULE_NAME}"
+MOONRAKER_TARGET="${MOONRAKER_DIR}/moonraker/components/${MODULE_NAME}"
 MOONRAKER_CONFIG_DIR="$(cd "$(dirname "$MOONRAKER_CONF")" && pwd)"
 MANAGER_CONF="${MOONRAKER_CONFIG_DIR}/${PROJECT_NAME}.conf"
 INCLUDE_LINE="[include ${PROJECT_NAME}.conf]"
 
-if [[ -L "$TARGET_FILE" ]]; then
-    rm "$TARGET_FILE"
-    echo "Removed Klipper module symlink: $TARGET_FILE"
-else
-    echo "No plugin symlink found at: $TARGET_FILE"
-fi
+remove_symlink() {
+    local target="$1"
+    local label="$2"
+    if [[ -L "$target" ]]; then
+        rm "$target"
+        echo "Removed ${label} module symlink: $target"
+    else
+        echo "No ${label} plugin symlink found at: $target"
+    fi
+}
+
+remove_symlink "$KLIPPER_TARGET" "Klipper"
+remove_symlink "$MOONRAKER_TARGET" "Moonraker"
 
 rm -f "$MANAGER_CONF"
 
@@ -63,6 +74,6 @@ path.write_text("\n".join(out).rstrip() + "\n")
 PY
 fi
 
-echo "Moonraker update-manager registration removed."
+echo "Moonraker component and update-manager registration removed."
 echo "Repository and persistent carbon-history data were left in place."
 echo "Remove the [activated_carbon_monitor ...] section from printer.cfg before restarting Klipper."
