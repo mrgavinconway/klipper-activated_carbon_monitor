@@ -33,17 +33,15 @@ class CarbonDashboardSensor:
         logging.info("Registered activated carbon dashboard sensor '%s'", self.name)
         return True
 
-    def set_status(
-        self, status: Dict[str, Any], klipper_connected: bool = True
-    ) -> None:
+    def set_status(self, status: Dict[str, Any]) -> None:
         measurements: Dict[str, Number] = {}
 
-        def add(name: str, value: Any, scale: float = 1.0) -> None:
+        def add(name: str, value: Any) -> None:
             if value is None or isinstance(value, bool):
                 return
             if not isinstance(value, (int, float)):
                 return
-            measurements[name] = float(value) * scale
+            measurements[name] = float(value)
 
         add("used_percent", status.get("used_percent"))
         add("projected_tvoc_mg_per_h", status.get("estimated_voc_rate_mg_h"))
@@ -97,17 +95,18 @@ class CarbonDashboardSensor:
 class ActivatedCarbonMonitorBridge:
     def __init__(self, config):
         self.server = config.get_server()
+        self.eventloop = self.server.get_event_loop()
         self.klippy_apis = self.server.lookup_component("klippy_apis")
         self.sensor_manager = self.server.load_component(config, "sensor")
 
         self.sensor_id = config.get("sensor_name", "activated_carbon")
         self.friendly_name = config.get("friendly_name", "Activated Carbon")
         self.preferred_object = config.get("klipper_object", None)
+        self.update_interval = config.getfloat(
+            "dashboard_update_interval", 60.0, minval=5.0
+        )
         self.object_name: Optional[str] = None
-        self.callback_registered = False
-        # Klipper subscription callbacks contain deltas, not complete objects.
-        # Keep a full cached copy so Mainsail always receives a stable sensor.
-        self.klipper_status: Dict[str, Any] = {}
+        self.poll_timer = self.eventloop.register_timer(self._poll_status)
 
         store_size = config.getint("sensor_store_size", 1200, minval=60)
         self.sensor = CarbonDashboardSensor(
@@ -164,42 +163,44 @@ class ActivatedCarbonMonitorBridge:
             return
 
         self.object_name = selected
-        callback = None
-        if not self.callback_registered:
-            callback = self._handle_status_update
-            self.callback_registered = True
 
-        initial = await self.klippy_apis.subscribe_objects(
-            {selected: None}, callback=callback, default={}
-        )
-        if selected in initial:
-            self.klipper_status = dict(initial[selected])
-            self.sensor.set_status(self.klipper_status, klipper_connected=True)
+        # Populate Mainsail immediately, then refresh from a full Klipper query
+        # once per configured interval. Full polling avoids delta/subscription
+        # cache edge cases and is more than fast enough for maintenance data.
+        await self._refresh_status()
+        self.poll_timer.start(delay=self.update_interval)
 
         logging.info(
-            "Activated Carbon Monitor dashboard bridge using Klipper object '%s'",
+            "Activated Carbon Monitor dashboard bridge using Klipper object '%s' "
+            "with %.0f second updates",
             selected,
+            self.update_interval,
         )
 
-    def _handle_status_update(
-        self, status: Dict[str, Dict[str, Any]], eventtime: float
-    ) -> None:
+    async def _refresh_status(self) -> None:
         if self.object_name is None:
             return
-        update = status.get(self.object_name)
-        if update is not None:
-            self.klipper_status.update(update)
-            self.sensor.set_status(
-                self.klipper_status, klipper_connected=True
-            )
+        result = await self.klippy_apis.query_objects(
+            {self.object_name: None}, default={}
+        )
+        status = result.get(self.object_name)
+        if status is not None:
+            self.sensor.set_status(status)
+
+    async def _poll_status(self, eventtime: float) -> float:
+        await self._refresh_status()
+        return eventtime + self.update_interval
 
     async def _handle_klippy_disconnect(self) -> None:
+        self.poll_timer.stop()
         self.sensor.mark_disconnected("Klipper disconnected")
 
     async def _handle_klippy_shutdown(self) -> None:
+        self.poll_timer.stop()
         self.sensor.mark_disconnected("Klipper shutdown")
 
     def close(self) -> None:
+        self.poll_timer.stop()
         self.sensor.close()
 
 
