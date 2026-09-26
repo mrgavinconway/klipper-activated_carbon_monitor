@@ -13,8 +13,6 @@ The design goal is deliberately simple: for a normal installation the user provi
 fans: hepa_left, hepa_right
 fan_cfm: 5.0, 5.0
 carbon_g: 300
-fan_cfm: 5.0, 5.0
-carbon_g: 300
 ```
 
 `fan_cfm` follows the same order as `fans`. Use the best estimate of airflow through each installed carbon filter at 100% fan speed; measured loaded-filter airflow is preferable to a free-air datasheet rating.
@@ -26,6 +24,7 @@ The plugin automatically uses:
 - `extruder`
 - `heater_bed`
 - Klipper's `idle_timeout` state to determine whether printing is active
+- Klipper `print_stats.filename` as the preferred automatic material signal when the filename contains a recognised material token
 - a temperature sensor whose name contains `chamber` or `enclosure`, when available
 - fan `speed` and `rpm` reported by Klipper
 - built-in material temperature profiles and conservative TVOC baselines
@@ -102,13 +101,52 @@ Replacement in days
 
 Additional internal values remain available through the Klipper status object for calculations, macros and debugging, but are not mirrored into the Mainsail card.
 
-The inferred material name remains available through the Klipper object and `CARBON_STATUS`. Mainsail's generic Moonraker sensor widget currently accepts numeric measurements, so the bridge does not encode material names such as `ABS` or `ASA` as arbitrary numbers.
+The detected material name and its source remain available through the Klipper object and `CARBON_STATUS`. Mainsail's generic Moonraker sensor widget currently accepts numeric measurements, so the bridge does not encode material names such as `ABS` or `ASA` as arbitrary numbers.
 
 Carbon state is shown in **Miscellaneous**, rather than pretending that carbon remaining or VOC load is a temperature. The Klipper object remains the source of truth; Moonraker only mirrors it for the UI.
 
-## Material inference and projected VOCs
+## Material detection and projected VOCs
 
-The plugin compares the active nozzle target, bed target and available chamber temperature against built-in material profiles.
+Automatic material detection uses this order:
+
+1. a recognised material token in the current G-code filename;
+2. temperature-based inference from nozzle, bed and optional chamber temperatures; and
+3. conservative `UNKNOWN` behaviour when no material can be identified.
+
+A manual `CARBON_SET_MATERIAL` override takes precedence over all automatic detection until `CARBON_AUTO_MATERIAL` is called.
+
+### Filename detection
+
+Klipper's standard `print_stats` object exposes the selected G-code filename. The monitor tokenises that filename and recognises material names such as:
+
+```text
+ABS
+ASA
+PLA
+PETG
+TPU
+PC
+PA
+PA6
+PA12
+NYLON
+HIPS
+PVA
+```
+
+For example:
+
+```text
+EMU_Split_base_Left_Front_ABS_4h22m.gcode
+```
+
+is identified as `ABS` with `material_source: filename`, even though its temperatures may also overlap with ASA.
+
+`PA6`, `PA12` and `NYLON` map to the built-in `PA` profile.
+
+### Temperature fallback
+
+When the filename does not contain a recognised material token, the plugin compares the active nozzle target, bed target and available chamber temperature against built-in material profiles.
 
 If more than one filament is plausible at the same temperatures, it intentionally chooses the plausible material with the **higher baseline TVOC emission rate**. This is a conservative service-life rule, not a claim that the printer has positively identified the polymer.
 
@@ -140,11 +178,11 @@ Bed:    105 °C
 Chamber: 50 °C
 ```
 
-may plausibly match ABS, ASA and other engineering materials. The plugin chooses whichever matching candidate has the largest built-in TVOC baseline. The full candidate list is also exposed through `material_candidates`.
+may plausibly match ABS, ASA and other engineering materials. If the filename identifies ABS, ABS wins. Otherwise temperature inference chooses whichever matching candidate has the largest built-in TVOC baseline. The full temperature candidate list is also exposed through `material_candidates`.
 
 ## Manual material override
 
-Temperature inference is the default, but slicer G-code can provide an exact material when desired:
+An explicit material can be supplied at any time:
 
 ```text
 CARBON_SET_MATERIAL FILTER=chamber MATERIAL=ABS
@@ -152,7 +190,9 @@ CARBON_SET_MATERIAL FILTER=chamber MATERIAL=ABS
 
 `NYLON` is accepted as an alias for `PA`.
 
-Return to automatic inference with:
+A manual override affects **future samples only**. It does not rewrite VOC generation, filtered VOC or service usage already accumulated earlier in the print.
+
+Return to automatic filename/temperature detection with:
 
 ```text
 CARBON_AUTO_MATERIAL FILTER=chamber
@@ -198,7 +238,7 @@ The older `hepa_left@5.0` form remains accepted for compatibility, but `fan_cfm`
 
 ## Carbon burn-down model
 
-While a print is active, the inferred material selects a projected TVOC baseline.
+While a print is active, the detected material selects a projected TVOC baseline.
 
 The plugin accumulates projected emitted VOC mass:
 
@@ -206,9 +246,18 @@ The plugin accumulates projected emitted VOC mass:
 estimated VOC generated += material TVOC mg/h × elapsed print time
 ```
 
-It then scales carbon service usage by:
+VOC-rich chamber air can reach exposed carbon even when the filtration fans are stopped, so active printing has a small passive loading floor. The default is 5% of normal forced-flow exposure:
 
-1. current relative filter airflow; and
+```text
+exposure fraction =
+    passive_print_load + (1 - passive_print_load) × airflow fraction
+```
+
+At the default `passive_print_load: 0.05`, this gives 5% loading with the fans off and 100% loading at full airflow.
+
+The service model then scales carbon usage by:
+
+1. the effective exposure fraction; and
 2. the material's TVOC baseline relative to ABS.
 
 When the filter is running outside an active print, a smaller background load is applied because exposed activated carbon continues to age in warm/ambient air.
@@ -222,7 +271,7 @@ active service capacity =
 
 This is intentionally a practical maintenance heuristic rather than a claim that all activated carbon has an identical adsorption capacity.
 
-Carbon also ages while exposed to ambient/chamber air even if the fans are not running. The default calendar limit is 60 days. The monitor uses whichever limit is reached first: active-load exhaustion or calendar exposure.
+Carbon also ages while exposed to ambient/chamber air even if the fans are not running. The default calendar limit is 60 days. Calendar ageing and active loading both contribute to the displayed used percentage.
 
 Optional tuning:
 
@@ -230,6 +279,7 @@ Optional tuning:
 service_life_hours_per_100g: 50
 calendar_life_days: 60
 background_load: 0.20
+passive_print_load: 0.05
 projection_window_days: 14
 ```
 
@@ -336,9 +386,11 @@ After installation, add the minimum section to `printer.cfg`:
 ```ini
 [activated_carbon_monitor chamber]
 fans: hepa_left, hepa_right
+fan_cfm: 5.0, 5.0
+carbon_g: 300
 ```
 
-Replace the fan object names with the actual Klipper objects that move air through your activated carbon.
+Replace the fan object names, CFM values and carbon mass with those for the installed filtration system.
 
 When the printer is idle, restart Klipper to load the new module. Restart Moonraker to load the dashboard companion and update-manager entry. The installer can prompt for these restarts, but will not perform them without confirmation.
 
