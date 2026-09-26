@@ -31,6 +31,7 @@ DEFAULT_SERVICE_LIFE_HOURS_PER_100G = 50.0
 DEFAULT_CARBON_G = 100.0
 DEFAULT_CALENDAR_LIFE_DAYS = 60.0
 DEFAULT_BACKGROUND_LOAD = 0.20
+DEFAULT_PASSIVE_PRINT_LOAD = 0.05
 
 
 class ActivatedCarbonMonitor:
@@ -66,6 +67,9 @@ class ActivatedCarbonMonitor:
         )
         self.background_load = config.getfloat(
             "background_load", DEFAULT_BACKGROUND_LOAD, minval=0.)
+        self.passive_print_load = config.getfloat(
+            "passive_print_load", DEFAULT_PASSIVE_PRINT_LOAD,
+            minval=0., maxval=1.)
         self.sample_interval = config.getfloat("sample_interval", 5., above=0.)
         self.save_interval = config.getfloat("save_interval", 60., above=0.)
         self.projection_window_days = config.getfloat(
@@ -370,22 +374,26 @@ class ActivatedCarbonMonitor:
         return airflow_fraction, (cfm_total if cfm_known else None), speeds, rpms
 
     def _remaining_fraction(self):
-        # Carbon can be retired either through active filtration load or simply
-        # through prolonged exposure to ambient/chamber air. Use whichever
-        # limit is closer to exhaustion.
+        # Calendar ageing and active VOC loading are independent depletion
+        # mechanisms. Combine their remaining fractions so both contribute.
         active_capacity = self.service_life_hours * 3600.
         active_used = (
             self.service_usage_seconds / active_capacity
             if active_capacity > 0. else 1.0
         )
+        active_used = max(0., min(1., active_used))
+
         age_seconds = max(0., time.time() - self.installed_at)
         calendar_capacity = self.calendar_life_days * 86400.
         calendar_used = (
             age_seconds / calendar_capacity
             if calendar_capacity > 0. else 1.0
         )
-        used = max(active_used, calendar_used)
-        return max(0., min(1., 1. - used))
+        calendar_used = max(0., min(1., calendar_used))
+
+        active_remaining = 1. - active_used
+        calendar_remaining = 1. - calendar_used
+        return max(0., min(1., active_remaining * calendar_remaining))
 
     def _record_daily_usage(self, epoch, service_seconds):
         day = time.strftime("%Y-%m-%d", time.localtime(epoch))
@@ -458,25 +466,40 @@ class ActivatedCarbonMonitor:
         voc_rate = profile["voc_mg_h"] if printing else 0.
         self.current_voc_rate_mg_h = voc_rate
 
+        service_seconds = 0.
+
         if printing and elapsed > 0.:
+            # Even with the fans stopped, VOC-rich chamber air reaches exposed
+            # carbon through diffusion and natural convection. Treat that as a
+            # small passive fraction of normal forced-flow loading. Forced
+            # airflow then scales smoothly from that floor to 100%.
+            exposure_fraction = (
+                self.passive_print_load
+                + (1. - self.passive_print_load) * airflow_fraction
+            )
+
             generated = voc_rate * elapsed / 3600.
             self.estimated_voc_generated_mg += generated
             self.voc_by_material_mg[self.current_material] = (
                 self.voc_by_material_mg.get(self.current_material, 0.) + generated)
-            filtered = generated * airflow_fraction
+            filtered = generated * exposure_fraction
             self.estimated_voc_filtered_mg += filtered
+
+            voc_load = max(
+                self.background_load, voc_rate / REFERENCE_VOC_MG_H)
+            service_seconds = elapsed * exposure_fraction * voc_load
+
+        elif airflow_fraction > 0. and elapsed > 0.:
+            # Filtering ambient/chamber air outside a print still consumes a
+            # smaller amount of carbon capacity.
+            service_seconds = elapsed * airflow_fraction * self.background_load
 
         if airflow_fraction > 0. and elapsed > 0.:
             self.active_seconds += elapsed
             if airflow_cfm is not None:
                 self.air_processed_ft3 += airflow_cfm * elapsed / 60.
 
-            if printing:
-                voc_load = max(
-                    self.background_load, voc_rate / REFERENCE_VOC_MG_H)
-            else:
-                voc_load = self.background_load
-            service_seconds = elapsed * airflow_fraction * voc_load
+        if service_seconds > 0.:
             self.service_usage_seconds += service_seconds
             self._record_daily_usage(epoch, service_seconds)
 
@@ -568,6 +591,7 @@ class ActivatedCarbonMonitor:
             "service_life_hours_per_100g": self.service_life_hours_per_100g,
             "carbon_g": self.carbon_g,
             "calendar_life_days": self.calendar_life_days,
+            "passive_print_load": self.passive_print_load,
             "current_material": self.current_material,
             "material_source": self.material_source,
             "material_candidates": inferred_candidates,
