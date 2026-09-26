@@ -6,6 +6,7 @@
 import json
 import logging
 import os
+import re
 import time
 
 
@@ -83,6 +84,7 @@ class ActivatedCarbonMonitor:
         self.bed = None
         self.chamber = None
         self.idle_timeout = None
+        self.print_stats = None
 
         self.current_material = "UNKNOWN"
         self.material_source = "inferred"
@@ -111,11 +113,11 @@ class ActivatedCarbonMonitor:
             desc="Report activated carbon monitor status")
         self.gcode.register_mux_command(
             "CARBON_SET_MATERIAL", "FILTER", self.name,
-            self.cmd_CARBON_SET_MATERIAL, desc="Override inferred material")
+            self.cmd_CARBON_SET_MATERIAL, desc="Override detected material")
         self.gcode.register_mux_command(
             "CARBON_AUTO_MATERIAL", "FILTER", self.name,
             self.cmd_CARBON_AUTO_MATERIAL,
-            desc="Return to temperature-based material inference")
+            desc="Return to automatic material detection")
         self.gcode.register_mux_command(
             "CARBON_REPLACE", "FILTER", self.name, self.cmd_CARBON_REPLACE,
             desc="Record activated carbon replacement")
@@ -257,6 +259,7 @@ class ActivatedCarbonMonitor:
         self.extruder = self.printer.lookup_object(self.extruder_name, None)
         self.bed = self.printer.lookup_object(self.bed_name, None)
         self.idle_timeout = self.printer.lookup_object("idle_timeout", None)
+        self.print_stats = self.printer.lookup_object("print_stats", None)
         self.chamber = self._find_chamber_sensor()
 
         now = self.reactor.monotonic()
@@ -314,6 +317,31 @@ class ActivatedCarbonMonitor:
     def _in_range(value, bounds):
         return bounds[0] <= value <= bounds[1]
 
+    def _filename_material(self, eventtime):
+        """Return a material explicitly named in the active G-code filename."""
+        if self.print_stats is None:
+            return None
+        try:
+            filename = str(
+                self.print_stats.get_status(eventtime).get("filename", "") or ""
+            )
+        except Exception:
+            return None
+        if not filename:
+            return None
+
+        aliases = {
+            "NYLON": "PA",
+            "PA6": "PA",
+            "PA12": "PA",
+        }
+        tokens = re.findall(r"[A-Z0-9]+", os.path.basename(filename).upper())
+        for token in tokens:
+            material = aliases.get(token, token)
+            if material in MATERIAL_PROFILES and material != "UNKNOWN":
+                return material
+        return None
+
     def _infer_material(self, eventtime):
         nozzle, nozzle_target = self._temperature(self.extruder, eventtime)
         bed, bed_target = self._temperature(self.bed, eventtime)
@@ -344,6 +372,13 @@ class ActivatedCarbonMonitor:
         candidates.sort(
             key=lambda name: MATERIAL_PROFILES[name]["voc_mg_h"], reverse=True)
         return candidates[0], candidates
+
+    def _auto_material(self, eventtime):
+        filename_material = self._filename_material(eventtime)
+        if filename_material is not None:
+            return filename_material, "filename", []
+        material, candidates = self._infer_material(eventtime)
+        return material, "inferred", candidates
 
     def _fan_state(self, eventtime):
         speeds = {}
@@ -457,8 +492,10 @@ class ActivatedCarbonMonitor:
         self.current_fan_speeds = speeds
         self.current_fan_rpms = rpms
 
-        if self.material_source == "inferred":
-            self.current_material, _ = self._infer_material(eventtime)
+        if self.material_source != "manual":
+            self.current_material, self.material_source, _ = self._auto_material(
+                eventtime
+            )
 
         profile = MATERIAL_PROFILES.get(
             self.current_material, MATERIAL_PROFILES["UNKNOWN"])
@@ -652,15 +689,15 @@ class ActivatedCarbonMonitor:
             (material, MATERIAL_PROFILES[material]["voc_mg_h"]))
 
     def cmd_CARBON_AUTO_MATERIAL(self, gcmd):
-        self.material_source = "inferred"
-        self.current_material, candidates = self._infer_material(
-            self.reactor.monotonic())
+        self.current_material, self.material_source, candidates = self._auto_material(
+            self.reactor.monotonic()
+        )
         self._save_state()
-        suffix = ""
-        if len(candidates) > 1:
-            suffix = " (conservative choice from %s)" % ", ".join(candidates)
+        suffix = " (%s)" % self.material_source
+        if self.material_source == "inferred" and len(candidates) > 1:
+            suffix += " (conservative choice from %s)" % ", ".join(candidates)
         gcmd.respond_info(
-            "Carbon material inference enabled: %s%s" %
+            "Carbon automatic material detection enabled: %s%s" %
             (self.current_material, suffix))
 
     def cmd_CARBON_REPLACE(self, gcmd):
